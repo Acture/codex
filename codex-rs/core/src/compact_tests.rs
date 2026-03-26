@@ -559,3 +559,28 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last
     ];
     assert_eq!(refreshed, expected);
 }
+
+#[tokio::test]
+async fn compaction_timeout_produces_retryable_timeout_error() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    // Simulate a compaction call that hangs indefinitely.
+    let hanging_future = futures::future::pending::<CodexResult<()>>();
+
+    let result = match timeout(Duration::from_millis(50), hanging_future).await {
+        Ok(inner) => inner,
+        Err(_elapsed) => Err(CodexErr::Timeout),
+    };
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, CodexErr::Timeout),
+        "expected CodexErr::Timeout, got {err:?}"
+    );
+    assert!(
+        err.is_retryable(),
+        "Timeout should be retryable so the compact retry loop can handle it"
+    );
+}

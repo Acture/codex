@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::ModelProviderInfo;
 use crate::Prompt;
@@ -26,7 +27,13 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
 use futures::prelude::*;
+use tokio::time::timeout;
 use tracing::error;
+
+/// Maximum time to wait for a compaction operation to complete before
+/// treating it as a timeout. This prevents the UI from hanging
+/// indefinitely when the model API is unresponsive.
+pub(crate) const COMPACTION_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub const SUMMARIZATION_PROMPT: &str = include_str!("../templates/compact/prompt.md");
 pub const SUMMARY_PREFIX: &str = include_str!("../templates/compact/summary_prefix.md");
@@ -126,14 +133,21 @@ async fn run_compact_task_inner(
             ..Default::default()
         };
         let turn_metadata_header = turn_context.turn_metadata_state.current_header_value();
-        let attempt_result = drain_to_completed(
-            &sess,
-            turn_context.as_ref(),
-            &mut client_session,
-            turn_metadata_header.as_deref(),
-            &prompt,
+        let attempt_result = match timeout(
+            COMPACTION_TIMEOUT,
+            drain_to_completed(
+                &sess,
+                turn_context.as_ref(),
+                &mut client_session,
+                turn_metadata_header.as_deref(),
+                &prompt,
+            ),
         )
-        .await;
+        .await
+        {
+            Ok(inner) => inner,
+            Err(_elapsed) => Err(CodexErr::Timeout),
+        };
 
         match attempt_result {
             Ok(()) => {

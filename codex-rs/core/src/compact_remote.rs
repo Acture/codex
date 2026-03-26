@@ -21,9 +21,12 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseItem;
 use futures::TryFutureExt;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 use tracing::info;
+
+use crate::compact::COMPACTION_TIMEOUT;
 
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
@@ -114,29 +117,35 @@ async fn run_remote_compact_task_inner_impl(
         output_schema: None,
     };
 
-    let mut new_history = sess
-        .services
-        .model_client
-        .compact_conversation_history(
-            &prompt,
-            &turn_context.model_info,
-            turn_context.reasoning_effort,
-            turn_context.reasoning_summary,
-            &turn_context.session_telemetry,
-        )
-        .or_else(|err| async {
-            let total_usage_breakdown = sess.get_total_token_usage_breakdown().await;
-            let compact_request_log_data =
-                build_compact_request_log_data(&prompt.input, &prompt.base_instructions.text);
-            log_remote_compact_failure(
-                turn_context,
-                &compact_request_log_data,
-                total_usage_breakdown,
-                &err,
-            );
-            Err(err)
-        })
-        .await?;
+    let mut new_history = match timeout(
+        COMPACTION_TIMEOUT,
+        sess.services
+            .model_client
+            .compact_conversation_history(
+                &prompt,
+                &turn_context.model_info,
+                turn_context.reasoning_effort,
+                turn_context.reasoning_summary,
+                &turn_context.session_telemetry,
+            )
+            .or_else(|err| async {
+                let total_usage_breakdown = sess.get_total_token_usage_breakdown().await;
+                let compact_request_log_data =
+                    build_compact_request_log_data(&prompt.input, &prompt.base_instructions.text);
+                log_remote_compact_failure(
+                    turn_context,
+                    &compact_request_log_data,
+                    total_usage_breakdown,
+                    &err,
+                );
+                Err(err)
+            }),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_elapsed) => return Err(CodexErr::Timeout),
+    };
     new_history = process_compacted_history(
         sess.as_ref(),
         turn_context.as_ref(),
